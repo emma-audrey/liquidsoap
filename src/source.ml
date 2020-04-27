@@ -525,10 +525,13 @@ class virtual operator ?(name = "src") content_kind sources =
      * must be properly ended. *)
     method virtual is_ready : bool
 
-    (* True if the source manipulates video data in place. If so,
-       shared video content is copied between being passed to this
+    (* True if any of the underlying sources manipulates video data in place.
+       If so, shared video content is copied between being passed to this
        operator. *)
-    method needs_fresh_video = false
+    method needs_fresh_video =
+      List.exists
+        (fun s -> s#needs_fresh_video)
+        (List.flatten static_activations @ List.flatten dynamic_activations)
 
     (* If possible, end the current track.
      * Typically, that signal is just re-routed, or makes the next file
