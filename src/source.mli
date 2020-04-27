@@ -156,8 +156,8 @@ class virtual source :
        (** [is_ready] tells you if [get] can be called. *)
        method virtual is_ready : bool
 
-       (** True if the source manipulates video data in place. If so,
-           shared video content is copied between being passed to this
+       (** True if any of the underlying sources manipulates video data in place.
+           If so, shared video content is copied before being passed down by this
            operator. *)
        method needs_fresh_video : bool
 
