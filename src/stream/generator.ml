@@ -593,7 +593,11 @@ module From_audio_video = struct
     let pts = Frame.pts frame in
     let mode = match mode with Some mode -> mode | None -> t.mode in
 
+    (* Audio buffer is passed down to the decoders so we need to copy it
+       before storing it for later use. *)
     let audio () = Array.map Audio.Mono.copy Frame.(frame.content.audio) in
+    (* Video data is actually acessible frame by frame is can be stored for
+       later use as-is. *)
     let video = Frame.(frame.content.video) in
 
     match mode with
