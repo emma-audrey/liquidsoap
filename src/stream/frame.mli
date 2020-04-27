@@ -53,7 +53,7 @@ and midi_t = MIDI.buffer
     [o1] into [c2] starting at offset [o2]. All numerical values are in
     ticks. Video frames are assigned unless a copy is requested. *)
 val blit_content :
-  copy_video:bool -> content -> int -> content -> int -> int -> unit
+  fresh_video:bool -> content -> int -> content -> int -> int -> unit
 
 (** Make a copy of the content of a frame. *)
 val copy : content -> content
@@ -171,7 +171,7 @@ val get_past_metadata : t -> metadata option
 
 exception No_chunk
 
-val get_chunk : copy_video:bool -> t -> t -> unit
+val get_chunk : fresh_video:bool -> t -> t -> unit
 
 (** {2 Compatibilities between content values, types and kinds} *)
 

@@ -600,7 +600,7 @@ class virtual operator ?(name = "src") content_kind sources =
             self#log#severe "#get_frame didn't add exactly one break!";
             assert false ) )
       else (
-        try Frame.get_chunk ~copy_video:self#needs_fresh_video buf memo
+        try Frame.get_chunk ~fresh_video:self#needs_fresh_video buf memo
         with Frame.No_chunk ->
           if not self#is_ready then silent_end_track ()
           else (
