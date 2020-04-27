@@ -526,7 +526,7 @@ class virtual operator ?(name = "src") content_kind sources =
     method virtual is_ready : bool
 
     (* True if any of the underlying sources manipulates video data in place.
-       If so, shared video content is copied between being passed to this
+       If so, shared video content is copied before being passed down by this
        operator. *)
     method needs_fresh_video =
       List.exists
