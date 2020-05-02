@@ -76,60 +76,55 @@ let buffered_input input =
 
 let log = Log.make ["decoder"; "aac"]
 
-module Make (Generator : Generator.S_Asio) = struct
-  let create_decoder input =
-    let resampler = Rutils.create_audio () in
-    let dec = Faad.create () in
-    let input, drop, pos = buffered_input input in
-    let offset, sample_freq, chans =
-      let initbuflen = 1024 in
-      let initbuf = Bytes.create initbuflen in
-      let len = input.Decoder.read initbuf 0 initbuflen in
-      Faad.init dec initbuf 0 len
-    in
-    drop offset;
-    pos := 0;
-    let processed = ref 0 in
-    let aacbuflen = Faad.min_bytes_per_channel * chans in
-    let aacbuf = Bytes.create aacbuflen in
-    (* We approximate bitrate for seeking.. *)
-    let seek ticks =
-      if
-        !processed == 0 || !pos == 0
-        || input.Decoder.lseek == None
-        || input.Decoder.tell == None
-      then 0
-      else (
-        let cur_time = float !processed /. float sample_freq in
-        let rate = float !pos /. cur_time in
-        let offset = Frame.seconds_of_master ticks in
-        let bytes = int_of_float (rate *. offset) in
-        try
-          ignore
-            ((Utils.get_some input.Decoder.lseek)
-               ((Utils.get_some input.Decoder.tell) () + bytes));
-          Faad.post_sync_reset dec;
-          ticks
-        with _ -> 0 )
-    in
-    {
-      Decoder.seek;
-      decode =
-        (fun gen ->
-          let len = input.Decoder.read aacbuf 0 aacbuflen in
-          if len = aacbuflen then (
-            let pos, data = Faad.decode dec aacbuf 0 len in
-            let data = Audio.of_array data in
-            begin
-              try processed := !processed + Audio.length data with _ -> ()
-            end;
-            drop pos;
-            let content = resampler ~audio_src_rate:(float sample_freq) data in
-            (* TODO assert (Array.length content.(0) = length) ? *)
-            Generator.set_mode gen `Audio;
-            Generator.put_audio gen content 0 (Audio.length content) ));
-    }
-end
+let create_decoder input =
+  let dec = Faad.create () in
+  let input, drop, pos = buffered_input input in
+  let offset, samplerate, chans =
+    let initbuflen = 1024 in
+    let initbuf = Bytes.create initbuflen in
+    let len = input.Decoder.read initbuf 0 initbuflen in
+    Faad.init dec initbuf 0 len
+  in
+  drop offset;
+  pos := 0;
+  let processed = ref 0 in
+  let aacbuflen = Faad.min_bytes_per_channel * chans in
+  let aacbuf = Bytes.create aacbuflen in
+  (* We approximate bitrate for seeking.. *)
+  let seek ticks =
+    if
+      !processed == 0 || !pos == 0
+      || input.Decoder.lseek == None
+      || input.Decoder.tell == None
+    then 0
+    else (
+      let cur_time = float !processed /. float samplerate in
+      let rate = float !pos /. cur_time in
+      let offset = Frame.seconds_of_master ticks in
+      let bytes = int_of_float (rate *. offset) in
+      try
+        ignore
+          ((Utils.get_some input.Decoder.lseek)
+             ((Utils.get_some input.Decoder.tell) () + bytes));
+        Faad.post_sync_reset dec;
+        ticks
+      with _ -> 0 )
+  in
+  {
+    Decoder.seek;
+    decode =
+      (fun buffer ->
+        let len = input.Decoder.read aacbuf 0 aacbuflen in
+        if len = aacbuflen then (
+          let pos, data = Faad.decode dec aacbuf 0 len in
+          let data = Audio.of_array data in
+          begin
+            try processed := !processed + Audio.length data with _ -> ()
+          end;
+          drop pos;
+
+          buffer.Decoder.put_audio ~samplerate data ));
+  }
 
 let aac_mime_types =
   Dtools.Conf.list
@@ -141,14 +136,6 @@ let aac_file_extensions =
   Dtools.Conf.list
     ~p:(Decoder.conf_file_extensions#plug "aac")
     "File extensions used for guessing AAC format" ~d:["aac"]
-
-module G = Generator.From_audio_video
-module Buffered = Decoder.Buffered (G)
-module Aac = Make (G)
-
-let create_file_decoder filename kind =
-  let generator = G.create `Audio in
-  Buffered.file_decoder filename kind Aac.create_decoder generator
 
 (* Get the number of channels of audio in an AAC file. *)
 let get_type filename =
@@ -172,27 +159,14 @@ let () =
     ~sdoc:
       "Use libfaad to decode AAC if MIME type or file extension is appropriate."
     (fun ~metadata:_ filename kind ->
-      (* Before doing anything, check that we are allowed to produce
-       * audio, and don't have to produce midi or video. Only then
-       * check that the file seems relevant for AAC decoding. *)
-      let content = get_type filename in
       if
-        content.Frame.audio = 0
-        || (not
-              ( Frame.mul_sub_mul Frame.Zero kind.Frame.video
-              && Frame.mul_sub_mul Frame.Zero kind.Frame.midi ))
-        || not
-             (Decoder.test_file ~mimes:aac_mime_types#get
-                ~extensions:aac_file_extensions#get ~log filename)
-      then None
-      else if
-        kind.Frame.audio = Frame.Any
-        || kind.Frame.audio = Frame.Succ Frame.Any
-        || Frame.type_has_kind content kind
-      then Some (fun () -> create_file_decoder filename kind)
+        Decoder.test_file ~mimes:aac_mime_types#get
+          ~extensions:aac_file_extensions#get ~log filename
+        && Decoder.can_decode_kind (get_type filename) kind
+      then
+        Some
+          (fun () -> Decoder.opaque_file_decoder ~filename ~kind create_decoder)
       else None)
-
-module D_stream = Make (Generator.From_audio_video_plus)
 
 let () =
   Decoder.stream_decoders#register "AAC"
@@ -213,55 +187,50 @@ let () =
          * decoding-time. Failing early would only be an advantage
          * if there was possibly another plugin for decoding
          * correctly the stream (e.g. by performing conversions). *)
-        Some D_stream.create_decoder
+        Some create_decoder
       else None)
 
 (* Mp4 decoding. *)
 
 let log = Log.make ["decoder"; "mp4"]
 
-module Make_mp4 (Generator : Generator.S_Asio) = struct
-  exception End_of_track
+exception End_of_track
 
-  let create_decoder input =
-    let dec = Faad.create () in
-    let read = input.Decoder.read in
-    let mp4 = Faad.Mp4.openfile ?seek:input.Decoder.lseek read in
-    let resampler = Rutils.create_audio () in
-    let track = Faad.Mp4.find_aac_track mp4 in
-    let sample_freq, _ = Faad.Mp4.init mp4 dec track in
-    let nb_samples = Faad.Mp4.samples mp4 track in
-    let sample = ref 0 in
-    let pos = ref 0 in
-    let ended = ref false in
-    let decode gen =
-      if !ended || !sample >= nb_samples || !sample < 0 then raise End_of_track;
-      let data = Faad.Mp4.decode mp4 track !sample dec in
-      let data = Audio.of_array data in
-      incr sample;
-      begin
-        try pos := !pos + Audio.length data with _ -> ()
-      end;
-      let content = resampler ~audio_src_rate:(float sample_freq) data in
-      Generator.set_mode gen `Audio;
-      Generator.put_audio gen content 0 (Audio.length content)
-    in
-    let seek ticks =
-      try
-        let time = Frame.seconds_of_master ticks in
-        let audio_ticks = int_of_float (time *. float sample_freq) in
-        let offset = max (!pos + audio_ticks) 0 in
-        let new_sample, _ = Faad.Mp4.seek mp4 track offset in
-        sample := new_sample;
-        let time = float (offset - !pos) /. float sample_freq in
-        pos := offset;
-        Frame.master_of_seconds time
-      with _ ->
-        ended := true;
-        0
-    in
-    { Decoder.decode; seek }
-end
+let create_decoder input =
+  let dec = Faad.create () in
+  let read = input.Decoder.read in
+  let mp4 = Faad.Mp4.openfile ?seek:input.Decoder.lseek read in
+  let track = Faad.Mp4.find_aac_track mp4 in
+  let samplerate, _ = Faad.Mp4.init mp4 dec track in
+  let nb_samples = Faad.Mp4.samples mp4 track in
+  let sample = ref 0 in
+  let pos = ref 0 in
+  let ended = ref false in
+  let decode buffer =
+    if !ended || !sample >= nb_samples || !sample < 0 then raise End_of_track;
+    let data = Faad.Mp4.decode mp4 track !sample dec in
+    let data = Audio.of_array data in
+    incr sample;
+    begin
+      try pos := !pos + Audio.length data with _ -> ()
+    end;
+    buffer.Decoder.put_audio ~samplerate data
+  in
+  let seek ticks =
+    try
+      let time = Frame.seconds_of_master ticks in
+      let audio_ticks = int_of_float (time *. float samplerate) in
+      let offset = max (!pos + audio_ticks) 0 in
+      let new_sample, _ = Faad.Mp4.seek mp4 track offset in
+      sample := new_sample;
+      let time = float (offset - !pos) /. float samplerate in
+      pos := offset;
+      Frame.master_of_seconds time
+    with _ ->
+      ended := true;
+      0
+  in
+  { Decoder.decode; seek }
 
 (* Get the number of channels of audio in an MP4 file. *)
 let get_type filename =
@@ -289,36 +258,18 @@ let mp4_file_extensions =
     "File extensions used for guessing MP4 format"
     ~d:["m4a"; "m4b"; "m4p"; "m4v"; "m4r"; "3gp"; "mp4"]
 
-module Mp4_dec = Make_mp4 (G)
-
-let create_file_decoder filename kind =
-  let generator = G.create `Audio in
-  Buffered.file_decoder filename kind Mp4_dec.create_decoder generator
-
 let () =
   Decoder.file_decoders#register "MP4"
     ~sdoc:
       "Use libfaad to decode MP4 if MIME type or file extension is appropriate."
     (fun ~metadata:_ filename kind ->
-      (* Before doing anything, check that we are allowed to produce
-       * audio, and don't have to produce midi or video. Only then
-       * check that the file seems relevant for MP4 decoding. *)
-      let content = get_type filename in
       if
-        content.Frame.audio = 0
-        || kind.Frame.audio = Frame.Zero
-        || (not
-              ( Frame.mul_sub_mul Frame.Zero kind.Frame.video
-              && Frame.mul_sub_mul Frame.Zero kind.Frame.midi ))
-        || not
-             (Decoder.test_file ~mimes:mp4_mime_types#get
-                ~extensions:mp4_file_extensions#get ~log filename)
-      then None
-      else if
-        kind.Frame.audio = Frame.Any
-        || kind.Frame.audio = Frame.Succ Frame.Any
-        || Frame.type_has_kind content kind
-      then Some (fun () -> create_file_decoder filename kind)
+        Decoder.test_file ~mimes:mp4_mime_types#get
+          ~extensions:mp4_file_extensions#get ~log filename
+        && Decoder.can_decode_kind (get_type filename) kind
+      then
+        Some
+          (fun () -> Decoder.opaque_file_decoder ~filename ~kind create_decoder)
       else None)
 
 let log = Log.make ["metadata"; "mp4"]

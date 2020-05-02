@@ -25,6 +25,8 @@
 exception End_of_file
 exception No_stream
 
+module Generator = Decoder.G
+
 let log = Log.make ["decoder"; "ffmpeg"]
 
 (** Configuration keys for ffmpeg. *)
@@ -42,10 +44,8 @@ let file_extensions =
 module ConverterInput = Swresample.Make (Swresample.Frame)
 module Converter = ConverterInput (Swresample.FltPlanarBigArray)
 module Scaler = Swscale.Make (Swscale.Frame) (Swscale.BigArray)
-module G = Generator.From_audio_video
-module Buffered = Decoder.Buffered (G)
 
-let mk_audio_decoder ~put_audio container =
+let mk_audio_decoder container =
   let idx, stream, codec = Av.find_best_audio_stream container in
   let sample_freq = Avcodec.Audio.get_sample_rate codec in
   let channel_layout = Avcodec.Audio.get_channel_layout codec in
@@ -61,7 +61,7 @@ let mk_audio_decoder ~put_audio container =
   let decoder_pts = ref 0L in
   ( idx,
     stream,
-    fun frame gen ->
+    fun ~buffer frame ->
       let frame_in_sample_format = Avutil.Audio.frame_get_sample_format frame in
       if !in_sample_format <> frame_in_sample_format then (
         log#important "Sample format change detected!";
@@ -74,9 +74,10 @@ let mk_audio_decoder ~put_audio container =
           !decoder_pts
       in
       decoder_pts := Int64.add !decoder_pts (Int64.of_int l);
-      put_audio ?pts:(Some pts) gen content 0 l )
+      buffer.Decoder.put_audio ?pts:(Some pts) ~samplerate:target_sample_rate
+        content )
 
-let mk_video_decoder ~put_video container =
+let mk_video_decoder container =
   let idx, stream, codec = Av.find_best_video_stream container in
   let pixel_format = Avcodec.Video.get_pixel_format codec in
   let width = Avcodec.Video.get_width codec in
@@ -90,11 +91,10 @@ let mk_video_decoder ~put_video container =
   in
   let time_base = Av.get_time_base stream in
   let pixel_aspect = Av.get_pixel_aspect stream in
-  let generator = ref None in
   let decoder_time_base = { Avutil.num = 1; den = target_fps } in
   let internal_time_base = Ffmpeg_utils.video_time_base () in
   let decoder_pts = ref 0L in
-  let cb frame =
+  let cb ~buffer frame =
     let img =
       match Scaler.convert scaler frame with
         | [| (y, sy); (u, s); (v, _) |] ->
@@ -107,42 +107,30 @@ let mk_video_decoder ~put_video container =
         !decoder_pts
     in
     decoder_pts := Int64.succ !decoder_pts;
-    put_video ?pts:(Some pts)
-      (Utils.get_some !generator)
-      [| content |] 0 (Video.length content)
+    buffer.Decoder.put_video ?pts:(Some pts)
+      ~fps:{ Decoder.num = target_fps; den = 1 }
+      [| content |]
   in
-  let fps_converter =
+  let fps_converter ~buffer =
     Ffmpeg_utils.fps_converter ~width ~height ~pixel_format ~time_base
-      ~pixel_aspect ~target_fps cb
+      ~pixel_aspect ~target_fps (cb ~buffer)
   in
-  ( idx,
-    stream,
-    fun frame gen ->
-      generator := Some gen;
-      fps_converter frame )
+  (idx, stream, fun ~buffer frame -> fps_converter ~buffer frame)
 
-let mk_decoder ~set_mode ~add_break ~audio ~video ~container =
+let mk_decoder ~audio ~video ~container =
   let rec read_input_frame () =
     try Av.read_input_frame container
     with Avutil.Error `Invalid_data -> read_input_frame ()
   in
-  let mode_set = ref false in
-  fun gen ->
-    if not !mode_set then (
-      match (audio, video) with
-        | Some _, Some _ -> set_mode gen `Both
-        | Some _, None -> set_mode gen `Audio
-        | None, Some _ -> set_mode gen `Video
-        | _ -> failwith "no content!" );
-    mode_set := true;
+  fun buffer ->
     match (audio, video, read_input_frame ()) with
       | Some (idx, _, decoder), _, `Audio (i, frame) when i = idx ->
-          decoder frame gen
+          decoder ~buffer frame
       | _, Some (idx, _, decoder), `Video (i, frame) when i = idx ->
-          decoder frame gen
+          decoder ~buffer frame
       | _ -> ()
       | exception Avutil.Error `Eof ->
-          add_break ?sync:(Some true) gen;
+          Generator.add_break ?sync:(Some true) buffer.Decoder.generator;
           raise End_of_file
 
 let seek ~audio ~video ticks =
@@ -190,48 +178,37 @@ let create_decoder fname =
   let container = Av.open_input fname in
   let audio =
     try
-      let idx, stream, decoder =
-        mk_audio_decoder ~put_audio:G.put_audio container
-      in
+      let idx, stream, decoder = mk_audio_decoder container in
       Some
         ( idx,
           stream,
-          fun frame gen ->
+          fun ~buffer frame ->
             set_remaining stream frame;
-            decoder frame gen )
+            decoder ~buffer frame )
     with Avutil.Error _ -> None
   in
   let video =
     try
-      let idx, stream, decoder =
-        mk_video_decoder ~put_video:G.put_video container
-      in
+      let idx, stream, decoder = mk_video_decoder container in
       Some
         ( idx,
           stream,
-          fun frame gen ->
+          fun ~buffer frame ->
             set_remaining stream frame;
-            decoder frame gen )
+            decoder ~buffer frame )
     with Avutil.Error _ -> None
   in
   let close () = Av.close container in
   ( {
       Decoder.seek = seek ~audio ~video;
-      decode =
-        mk_decoder ~set_mode:G.set_mode ~add_break:G.add_break ~audio ~video
-          ~container;
+      decode = mk_decoder ~audio ~video ~container;
     },
     close,
     get_remaining )
 
 let create_file_decoder filename kind =
-  let generator = G.create `Audio in
   let decoder, close, remaining = create_decoder filename in
-  let remaining frame offset =
-    let remaining = remaining () in
-    remaining + G.length generator + Frame.position frame - offset
-  in
-  Buffered.make_file_decoder ~filename ~close ~kind ~remaining decoder generator
+  Decoder.file_decoder ~filename ~close ~remaining ~kind decoder
 
 (* Get the type of an input container. *)
 let get_type ~url container =
@@ -284,19 +261,9 @@ let () =
       "Use libffmpeg to decode any file if its MIME type or file extension is \
        appropriate." (fun ~metadata:_ filename kind ->
       if
-        not
-          (Decoder.test_file ~mimes:mime_types#get
-             ~extensions:file_extensions#get ~log filename)
-      then None
-      else if
-        kind.Frame.audio = Frame.Any
-        || kind.Frame.audio = Frame.Succ Frame.Any
-        ||
-        if Frame.type_has_kind (get_file_type filename) kind then true
-        else (
-          log#important "File %S has an incompatible number of channels."
-            filename;
-          false )
+        Decoder.test_file ~mimes:mime_types#get ~extensions:file_extensions#get
+          ~log filename
+        && Decoder.can_decode_kind (get_file_type filename) kind
       then Some (fun () -> create_file_decoder filename kind)
       else None)
 
@@ -321,51 +288,29 @@ let check filename =
 
 let () = Request.dresolvers#register "FFMPEG" duration
 
-module Make (Generator : Generator.S_Asio) = struct
-  let create_decoder input =
-    let read = input.Decoder.read in
-    let seek_input =
-      match input.Decoder.lseek with
-        | None -> None
-        | Some fn -> Some (fun len _ -> fn len)
-    in
-    let container = Av.open_input_stream ?seek:seek_input read in
-    let audio =
-      try Some (mk_audio_decoder ~put_audio:Generator.put_audio container)
-      with Avutil.Error _ -> None
-    in
-    let video =
-      try Some (mk_video_decoder ~put_video:Generator.put_video container)
-      with Avutil.Error _ -> None
-    in
-    {
-      Decoder.seek = seek ~audio ~video;
-      decode =
-        mk_decoder ~set_mode:Generator.set_mode ~add_break:Generator.add_break
-          ~audio ~video ~container;
-    }
-end
-
-module D_stream = Make (Generator.From_audio_video_plus)
+let create_decoder input =
+  let read = input.Decoder.read in
+  let seek_input =
+    match input.Decoder.lseek with
+      | None -> None
+      | Some fn -> Some (fun len _ -> fn len)
+  in
+  let container = Av.open_input_stream ?seek:seek_input read in
+  let audio =
+    try Some (mk_audio_decoder container) with Avutil.Error _ -> None
+  in
+  let video =
+    try Some (mk_video_decoder container) with Avutil.Error _ -> None
+  in
+  {
+    Decoder.seek = seek ~audio ~video;
+    decode = mk_decoder ~audio ~video ~container;
+  }
 
 let () =
   Decoder.stream_decoders#register "FFMPEG"
     ~sdoc:"Use ffmpeg/libav to decode any stream with an appropriate MIME type."
-    (fun mime kind ->
-      let ( <: ) a b = Frame.mul_sub_mul a b in
-      if
-        List.mem mime mime_types#get
-        (* Check that it is okay to have zero video and midi,
-         * and at least one audio channel. *)
-        && Frame.Zero <: kind.Frame.video
-        && Frame.Zero <: kind.Frame.midi
-        && kind.Frame.audio <> Frame.Zero
-      then
-        (* In fact we can't be sure that we'll satisfy the content
-         * kind, because the stream might be mono or stereo.
-         * For now, we let this problem result in an error at
-         * decoding-time. Failing early would only be an advantage
-         * if there was possibly another plugin for decoding
-         * correctly the stream (e.g. by performing conversions). *)
-        Some D_stream.create_decoder
-      else None)
+    (fun mime _ ->
+      (* We can't really know what the stream is made of so we'll let the
+         decoder fail later. *)
+      if List.mem mime mime_types#get then Some create_decoder else None)

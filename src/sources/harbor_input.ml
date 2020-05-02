@@ -158,12 +158,13 @@ module Make (Harbor : T) = struct
         in
         try
           let decoder = create_decoder input in
+          let buffer = Decoder.mk_buffer ~kind generator in
           while true do
             Tutils.mutexify relay_m
               (fun () ->
                 if relay_socket = None then failwith "relaying stopped")
               ();
-            decoder.Decoder.decode generator
+            decoder.Decoder.decode buffer
           done
         with e ->
           (* Feeding has stopped: adding a break here. *)

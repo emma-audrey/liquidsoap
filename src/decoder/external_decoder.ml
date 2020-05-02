@@ -68,19 +68,15 @@ let duration process =
   ignore (Unix.close_process_in pull);
   ret
 
-module Generator = Generator.From_audio_video
-module Buffered = Decoder.Buffered (Generator)
-
 (** A function to wrap around the Wav_aiff_decoder *)
 let create process kind filename =
   let close = ref (fun () -> ()) in
   let create input =
     let input, actual_close = external_input process input in
     close := actual_close;
-    Wav_aiff_decoder.D.create ?header:None input
+    Wav_aiff_decoder.create ?header:None input
   in
-  let generator = Generator.create `Audio in
-  let dec = Buffered.file_decoder filename kind create generator in
+  let dec = Decoder.opaque_file_decoder ~filename ~kind create in
   {
     dec with
     Decoder.close =
@@ -91,7 +87,7 @@ let create_stream process input =
   let input, close = external_input process input in
   (* Put this here so that ret is not in its closure.. *)
   let close _ = close () in
-  let ret = Wav_aiff_decoder.D_stream.create input in
+  let ret = Wav_aiff_decoder.create input in
   Gc.finalise close ret;
   ret
 
@@ -157,6 +153,8 @@ let register_stdin name sdoc mimes test process =
 
 let log = Log.make ["decoder"; "external"; "oblivious"]
 
+module Generator = Decoder.G
+
 let external_input_oblivious process filename prebuf =
   let command = process filename in
   let process =
@@ -170,16 +168,20 @@ let external_input_oblivious process filename prebuf =
     try Process_handler.kill process with Process_handler.Finished -> ()
   in
   let input = { Decoder.read; tell = None; length = None; lseek = None } in
-  let gen = Generator.create `Audio in
+  let kind = Frame.{ audio = Any; video = Zero; midi = Zero } in
+  let gen =
+    Generator.create ~log_overfull:false ~log:(log#info "%s") ~kind `Audio
+  in
+  let buffer = Decoder.mk_buffer ~kind gen in
   let prebuf = Frame.master_of_seconds prebuf in
-  let decoder = Wav_aiff_decoder.D.create input in
+  let decoder = Wav_aiff_decoder.create input in
   let fill frame =
     begin
       try
         while
           Generator.length gen < prebuf && not (Process_handler.stopped process)
         do
-          decoder.Decoder.decode gen
+          decoder.Decoder.decode buffer
         done
       with e ->
         log#info "Decoding %s ended: %s." command (Printexc.to_string e);

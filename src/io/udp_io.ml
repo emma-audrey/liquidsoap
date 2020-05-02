@@ -145,9 +145,10 @@ class input ~kind ~hostname ~port ~decoder_factory ~bufferize ~log_overfull =
       try
         (* Feeding loop. *)
         let decoder = decoder_factory input in
+        let buffer = Decoder.mk_buffer ~kind generator in
         while true do
           if should_stop () then failwith "stop";
-          decoder.Decoder.decode generator
+          decoder.Decoder.decode buffer
         done
       with e ->
         Generator.add_break ~sync:true generator;

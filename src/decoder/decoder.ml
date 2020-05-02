@@ -38,25 +38,7 @@
   * plugins. For example:
   *   - choose ogg_demuxer when extension = ogg
   *   - choose mad when extension = mp3
-  *   - choose mad when mime-type = audio/mp3
-  *
-  * A few comments about the changes from the old decoding infrastructure:
-  *
-  * We need to change the closing policy (necessary to release resources
-  * immediately). In particular stream decoders shouldn't be in charge
-  * of closing the stream (sink) since they didn't open it: this trivializes
-  * the stream interface (sink) to an input function and a THREAD-SAFE
-  * generator.
-  *
-  * In MP3, we used openfile and openstream, but unifying doesn't change
-  * the performance.
-  *
-  * Estimating the remaining time can be done externally, based on the
-  * file description. This is equivalent to what is done currently,
-  * except in WAV.
-  *
-  * The WAV decoder doesn't fit the approx duration computation. (Toots: is that true?)
-  * The MIDI decoder doesn't use a buffer. TODO look at this carefully. *)
+  *   - choose mad when mime-type = audio/mp3 *)
 
 let log = Log.make ["decoder"]
 
@@ -66,8 +48,25 @@ type file = string
 (** A stream is identified by a MIME type. *)
 type stream = string
 
-type 'a decoder = {
-  decode : 'a -> unit;
+module G = Generator.From_audio_video_plus
+
+type fps = Decoder_utils.fps = { num : int; den : int }
+
+(* Buffer passed to decoder. This wraps around
+   regular buffer, adding:
+    - Implicit resampling
+    - Implicit audio channel conversion
+    - Implicit video resize
+    - Implicit fps conversion
+    - Implicit content drop *)
+type buffer = {
+  generator : G.t;
+  put_audio : ?pts:Int64.t -> samplerate:int -> Frame.audio_t array -> unit;
+  put_video : ?pts:Int64.t -> fps:fps -> Frame.video_t array -> unit;
+}
+
+type decoder = {
+  decode : buffer -> unit;
   (* [seek x]: Skip [x] master ticks.
    * Returns the number of ticks atcually skiped. *)
   seek : int -> int;
@@ -86,7 +85,7 @@ type input = {
   * and is generally assumed to not allocate resources (in the sense
   * of things that should be explicitly managed, not just garbage collected).
   * Hence it does not need a close function. *)
-type stream_decoder = input -> Generator.From_audio_video_plus.t decoder
+type stream_decoder = input -> decoder
 
 (** A decoder is a filling function and a closing function,
   * called at least when filling fails, i.e. the frame is partial.
@@ -197,23 +196,46 @@ let test_file ?(log = log) ~mimes ~extensions fname =
     false )
   else (
     let ext_ok =
-      try List.mem (Utils.get_ext fname) extensions with _ -> false
+      let ret =
+        try List.mem (Utils.get_ext fname) extensions with _ -> false
+      in
+      if not ret then log#info "Invalid file extension for %S!" fname;
+      ret
     in
-    let mime_ok, mime =
+    let mime_ok =
       match Configure.file_mime with
-        (* If no mime detection is available
-         * set the same result as file extension.. *)
-        | None -> (ext_ok, None)
+        | None -> false
         | Some mime_type ->
             let mime = mime_type fname in
-            (List.mem mime mimes, Some mime)
+            let ret = List.mem mime mimes in
+            if not ret then log#info "Invalid MIME type for %S: %s!" fname mime;
+            ret
     in
-    if ext_ok || mime_ok then true
-    else (
-      if (not mime_ok) && mime <> None then
-        log#info "Invalid MIME type for %S: %s!" fname (Utils.get_some mime);
-      if not ext_ok then log#info "Invalid file extension for %S!" fname;
-      false ) )
+    ext_ok || mime_ok )
+
+let can_decode_kind decoded_type target_kind =
+  let can_convert_audio audio =
+    audio = 0
+    || Audio_converter.Channel_layout.(
+         try
+           ignore
+             (create
+                (layout_of_channels decoded_type.Frame.audio)
+                (layout_of_channels audio));
+           true
+         with Unsupported -> false)
+  in
+  match Frame.type_of_kind target_kind with
+    (* Either we can decode straight away. *)
+    | _ when Frame.type_has_kind decoded_type target_kind -> true
+    (* Or we can convert audio and/or drop video and midi *)
+    | { Frame.audio; video; midi } ->
+        let audio =
+          if can_convert_audio audio then audio else decoded_type.Frame.audio
+        in
+        let video = if video = 0 then 0 else decoded_type.Frame.video in
+        let midi = if midi = 0 then 0 else decoded_type.Frame.midi in
+        Frame.type_has_kind { Frame.audio; video; midi } target_kind
 
 let dummy =
   {
@@ -302,116 +324,146 @@ let get_stream_decoder mime kind =
 
 (** {1 Helpers for defining decoders} *)
 
-module Buffered (Generator : Generator.S) = struct
-  let make_file_decoder ~filename ~close ~kind ~remaining decoder gen =
-    let prebuf =
-      (* Amount of audio to decode in advance, in ticks.
-       * It has to be more than a frame, but taking just one frame
-       * is unsatisfying because it yields very low initial estimations
-       * of the remaining time (which triggers early downloads,
-       * transitions, etc). This is because the decoder will often
-       * skip some hearders or metadata, giving the impression of
-       * a poor compression rate.
-       * We also guarantee that the remaining time will be precisely
-       * given for the last [prebuf] seconds of a file. But in
-       * practice it seems that we get pretty good estimations
-       * way before that point... unless perhaps when there's a lot
-       * of metadata (or ill-formed data) at the end of the file?
-       * It seems that 0.5 seconds is enough. The more we put,
-       * the higher will be the initial computation burst.
-       * Putting a setting for that is probably too obscure to
-       * be useful. *)
-      Frame.master_of_seconds 0.5
-    in
-    let decoding_done = ref false in
-    let fill frame =
-      (* We want to avoid trying to decode when
-       * it is no longer possible. Hence, this loop
-       * will be executed iff there was no exception
-       * raised before. If a decoder wants to recover
-       * on an exception, it should catch it and deal
-       * with it on its own. 
-       * Hence, the current policy for decoding is:
-       * decoding stops at the first exception raised. *)
-      if not !decoding_done then (
-        try
-          while Generator.length gen < prebuf do
-            decoder.decode gen
-          done
-        with e ->
-          log#info "Decoding %S ended: %s." filename (Printexc.to_string e);
-          log#debug "%s" (Printexc.get_backtrace ());
-          decoding_done := true;
-          if conf_debug#get then raise e );
-      let offset = Frame.position frame in
-      let old_breaks = Frame.breaks frame in
-      Generator.fill gen frame;
-      let content = frame.Frame.content in
-      let c_type = Frame.type_of_content content in
-      (* Check that we got only one chunk of data,
-       * and that it has a correct type. *)
-      if not (Frame.type_has_kind c_type kind) then (
-        log#severe "Decoder of %S produced %s, but %s was expected!" filename
-          (Frame.string_of_content_type c_type)
-          (Frame.string_of_content_kind kind);
+let mk_buffer ~kind generator =
+  let content_type = Frame.type_of_kind kind in
 
-        (* Pretend nothing happened, and end decoding. *)
-        Frame.set_breaks frame old_breaks;
-        Frame.add_break frame offset;
-        0 )
-      else (
-        try remaining frame offset
-        with e ->
-          log#info "Error while getting decoder's remaining time: %s"
-            (Printexc.to_string e);
-          decoding_done := true;
-          0 )
-    in
-    let fseek len =
-      let gen_len = Generator.length gen in
-      if len < 0 || len > gen_len then (
-        Generator.clear gen;
-        gen_len + decoder.seek (len - gen_len) )
-      else (
-        (* Seek within the pre-buffered data if possible *)
-        Generator.remove gen len;
-        len )
-    in
-    { fill; fseek; close }
+  let mode =
+    match content_type with
+      | { Frame.audio; video } when audio > 0 && video > 0 -> `Both
+      | { Frame.audio; video } when audio > 0 && video = 0 -> `Audio
+      | { Frame.audio; video } when audio = 0 && video > 0 -> `Video
+      | _ -> failwith "Invalid type for buffer!"
+  in
 
-  let file_decoder filename kind create_decoder gen =
-    let fd = Unix.openfile filename [Unix.O_RDONLY] 0 in
-    let file_size = (Unix.stat filename).Unix.st_size in
-    let proc_bytes = ref 0 in
-    let read buf ofs len =
+  G.set_mode generator mode;
+
+  let put_audio =
+    if mode <> `Video then (
+      let resampler = Decoder_utils.samplerate_converter () in
+      let channel_converter =
+        Decoder_utils.channels_converter content_type.Frame.audio
+      in
+      fun ?pts ~samplerate data ->
+        let data = resampler ~samplerate data in
+        let data = channel_converter data in
+        G.put_audio ?pts generator data 0 (Audio.length data) )
+    else fun ?pts:_ ~samplerate:_ _ -> ()
+  in
+
+  let put_video =
+    if mode <> `Audio then (
+      let video_resample = Decoder_utils.video_resample () in
+      let video_scale = Decoder_utils.video_scale () in
+      let out_freq =
+        Decoder_utils.{ num = Lazy.force Frame.video_rate; den = 1 }
+      in
+      fun ?pts ~fps data ->
+        let data = Array.map (Array.map video_scale) data in
+        let data = video_resample ~in_freq:fps ~out_freq data in
+        G.put_video ?pts generator data 0 (Video.length data.(0)) )
+    else fun ?pts:_ ~fps:_ _ -> ()
+  in
+
+  { generator; put_audio; put_video }
+
+let mk_decoder ~filename ~close ~remaining ~buffer decoder =
+  let prebuf = Frame.master_of_seconds 0.5 in
+  let decoding_done = ref false in
+
+  let remaining frame offset =
+    remaining () + G.length buffer.generator + Frame.position frame - offset
+  in
+
+  let fill frame =
+    if not !decoding_done then (
       try
-        let i = Unix.read fd buf ofs len in
-        proc_bytes := !proc_bytes + i;
-        i
-      with _ -> 0
-    in
-    let tell () = Unix.lseek fd 0 Unix.SEEK_CUR in
-    let length () = (Unix.fstat fd).Unix.st_size in
-    let lseek len = Unix.lseek fd len Unix.SEEK_SET in
-    let input =
-      { read; tell = Some tell; length = Some length; lseek = Some lseek }
-    in
-    let decoder = create_decoder input in
-    let out_ticks = ref 0 in
-    let remaining frame offset =
-      let in_bytes = tell () in
-      let gen_len = Generator.length gen in
-      out_ticks := !out_ticks + Frame.position frame - offset;
+        while G.length buffer.generator < prebuf do
+          decoder.decode buffer
+        done
+      with e ->
+        log#info "Decoding %S ended: %s." filename (Printexc.to_string e);
+        log#debug "%s" (Printexc.get_backtrace ());
+        decoding_done := true;
+        if conf_debug#get then raise e );
 
-      (* Compute an estimated number of remaining ticks. *)
-      if !proc_bytes = 0 then -1
-      else (
-        let compression = float (!out_ticks + gen_len) /. float !proc_bytes in
-        let remaining_ticks =
-          float gen_len +. (float (file_size - in_bytes) *. compression)
-        in
-        int_of_float remaining_ticks )
-    in
-    let close () = Unix.close fd in
-    make_file_decoder ~filename ~close ~kind ~remaining decoder gen
-end
+    let offset = Frame.position frame in
+    G.fill buffer.generator frame;
+
+    try remaining frame offset
+    with e ->
+      log#info "Error while getting decoder's remaining time: %s"
+        (Printexc.to_string e);
+      decoding_done := true;
+      0
+  in
+
+  let fseek len =
+    let gen_len = G.length buffer.generator in
+    if len < 0 || len > gen_len then (
+      G.clear buffer.generator;
+      gen_len + decoder.seek (len - gen_len) )
+    else (
+      (* Seek within the pre-buffered data if possible *)
+      G.remove buffer.generator len;
+      len )
+  in
+  { fill; fseek; close }
+
+let file_decoder ~filename ~close ~remaining ~kind decoder =
+  let generator =
+    G.create ~log_overfull:false ~log:(log#info "%s") ~kind `Undefined
+  in
+  let buffer = mk_buffer ~kind generator in
+  mk_decoder ~filename ~close ~remaining ~buffer decoder
+
+let opaque_file_decoder ~filename ~kind create_decoder =
+  let fd = Unix.openfile filename [Unix.O_RDONLY] 0 in
+
+  let file_size = (Unix.stat filename).Unix.st_size in
+  let proc_bytes = ref 0 in
+  let read buf ofs len =
+    try
+      let i = Unix.read fd buf ofs len in
+      proc_bytes := !proc_bytes + i;
+      i
+    with _ -> 0
+  in
+
+  let tell () = Unix.lseek fd 0 Unix.SEEK_CUR in
+  let length () = (Unix.fstat fd).Unix.st_size in
+  let lseek len = Unix.lseek fd len Unix.SEEK_SET in
+
+  let input =
+    { read; tell = Some tell; length = Some length; lseek = Some lseek }
+  in
+
+  let generator =
+    G.create ~log:(log#info "%s") ~log_overfull:false ~kind `Undefined
+  in
+  let buffer = mk_buffer ~kind generator in
+  let decoder = create_decoder input in
+
+  let out_ticks = ref 0 in
+  let decode buffer =
+    let start = G.length buffer.generator in
+    decoder.decode buffer;
+    let stop = G.length buffer.generator in
+    out_ticks := !out_ticks + stop - start
+  in
+
+  let decoder = { decoder with decode } in
+
+  let remaining () =
+    let in_bytes = tell () in
+
+    (* Compute an estimated number of remaining ticks. *)
+    if !proc_bytes = 0 then -1
+    else (
+      let compression = float !out_ticks /. float !proc_bytes in
+      let remaining_ticks = float (file_size - in_bytes) *. compression in
+      int_of_float remaining_ticks )
+  in
+
+  let close () = Unix.close fd in
+
+  mk_decoder ~filename ~close ~remaining ~buffer decoder

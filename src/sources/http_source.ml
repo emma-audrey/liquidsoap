@@ -302,10 +302,11 @@ module Make (Config : Config_t) = struct
         in
         try
           let decoder = create_decoder input in
+          let buffer = Decoder.mk_buffer ~kind generator in
           while true do
             if should_fail then failwith "end of track";
             if should_stop () || not relaying then failwith "source stopped";
-            decoder.Decoder.decode generator
+            decoder.Decoder.decode buffer
           done
         with e ->
           if debug then raise e;

@@ -36,14 +36,31 @@ type input = {
   length : (unit -> int) option;
 }
 
-type 'a decoder = {
-  decode : 'a -> unit;
+module G = Generator.From_audio_video_plus
+
+type fps = Decoder_utils.fps = { num : int; den : int }
+
+(* Buffer passed to decoder. This wraps around
+   regular buffer, adding:
+    - Implicit resampling
+    - Implicit audio channel conversion
+    - Implicit video resize
+    - Implicit fps conversion
+    - Implicit content drop *)
+type buffer = {
+  generator : G.t;
+  put_audio : ?pts:Int64.t -> samplerate:int -> Frame.audio_t array -> unit;
+  put_video : ?pts:Int64.t -> fps:fps -> Frame.video_t array -> unit;
+}
+
+type decoder = {
+  decode : buffer -> unit;
   (* [seek x]: Skip [x] master ticks.
    * Returns the number of ticks atcually skiped. *)
   seek : int -> int;
 }
 
-type stream_decoder = input -> Generator.From_audio_video_plus.t decoder
+type stream_decoder = input -> decoder
 
 type file_decoder = {
   fill : Frame.t -> int;
@@ -71,6 +88,10 @@ val conf_file_extensions : Dtools.Conf.ut
 val test_file :
   ?log:Log.t -> mimes:string list -> extensions:string list -> string -> bool
 
+(** Test if we can decode for a given kind. This include cases where we
+    know how to convert channel layout. *)
+val can_decode_kind : Frame.content_type -> Frame.content_kind -> bool
+
 val get_file_decoder :
   metadata:Frame.metadata ->
   file ->
@@ -80,23 +101,23 @@ val get_file_decoder :
 val get_image_file_decoder : file -> Video.Image.t option
 val get_stream_decoder : file -> Frame.content_kind -> stream_decoder option
 
-module Buffered (Generator : Generator.S) : sig
-  (* This is the most recent API. [file_decoder]
-   * below uses it and might be deprecated at some
-   * point in the future. *)
-  val make_file_decoder :
-    filename:string ->
-    close:(unit -> unit) ->
-    kind:Frame.content_kind ->
-    remaining:(Frame.t -> int -> int) ->
-    Generator.t decoder ->
-    Generator.t ->
-    file_decoder
+(* Initialize a decoding buffer *)
+val mk_buffer : kind:Frame.content_kind -> G.t -> buffer
 
-  val file_decoder :
-    file ->
-    Frame.content_kind ->
-    (input -> Generator.t decoder) ->
-    Generator.t ->
-    file_decoder
-end
+(* Create a file decoder when remaning time is known. *)
+val file_decoder :
+  filename:string ->
+  close:(unit -> unit) ->
+  remaining:(unit -> int) ->
+  kind:Frame.content_kind ->
+  decoder ->
+  file_decoder
+
+(* Create a file decoder when remaining time is not know,
+   in which case it is estimated from consumed bytes during
+   the decoding process. *)
+val opaque_file_decoder :
+  filename:string ->
+  kind:Frame.content_kind ->
+  (input -> decoder) ->
+  file_decoder
