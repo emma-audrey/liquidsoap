@@ -57,7 +57,7 @@ let () =
          Avutil.Log.set_callback (fun s -> log#f level "%s" (String.trim s))))
 
 let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
-    ~target_fps cb =
+    ?source_fps ~target_fps cb =
   let config = Avfilter.init () in
   let _buffer =
     let args =
@@ -67,6 +67,13 @@ let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
         `Pair ("time_base", `Rational time_base);
         `Pair ("pixel_aspect", `Rational pixel_aspect);
       ]
+    in
+    let args =
+      match source_fps with
+        | None -> args
+        | Some fps ->
+            `Pair ("frame_rate", `Rational { Avutil.num = fps; den = 1 })
+            :: args
     in
     Avfilter.attach ~name:"buffer" ~args Avfilter.buffer config
   in
@@ -78,7 +85,9 @@ let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
       | None -> failwith "Could not find fps ffmpeg filter!"
   in
   let fps =
-    let args = [`Pair ("fps", `Int target_fps)] in
+    let args =
+      [`Pair ("fps", `Rational { Avutil.num = target_fps; den = 1 })]
+    in
     Avfilter.attach ~name:"fps" ~args fps config
   in
   let _buffersink =
@@ -104,18 +113,26 @@ let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
     flush ()
 
 (* Source fps is not always known so it is optional here. *)
-let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect ?fps
-    ~target_fps cb =
-  match fps with
+let fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
+    ?source_fps ~target_fps cb =
+  match source_fps with
     | Some f when f = target_fps -> fun frame -> cb frame
     | _ ->
         fps_converter ~width ~height ~pixel_format ~time_base ~pixel_aspect
-          ~target_fps cb
+          ?source_fps ~target_fps cb
 
-let audio_time_base () =
+(* The following two are meant to be used for liq internally only!
+   In particular, we accept a time base with several video frames per
+   unit, i.e. time base = 3/60 with fps = 60 and liq internal frame
+   holding 3 video frames per frame. This is because, internally, we
+   gather frame additively and only care on liq frame synchronization,
+   dropping all video frames contained in a liq frame that is out of
+   sync. *)
+
+let liq_internal_audio_time_base () =
   { Avutil.num = AFrame.size (); den = Lazy.force Frame.audio_rate }
 
-let video_time_base () =
+let liq_internal_video_time_base () =
   { Avutil.num = VFrame.size (); den = Lazy.force Frame.video_rate }
 
 let convert_pts ~src ~dst pts =

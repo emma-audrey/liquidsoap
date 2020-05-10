@@ -57,7 +57,7 @@ let mk_audio_decoder container =
   in
   let converter = ref (mk_converter ()) in
   let decoder_time_base = { Avutil.num = 1; den = target_sample_rate } in
-  let internal_time_base = Ffmpeg_utils.audio_time_base () in
+  let internal_time_base = Ffmpeg_utils.liq_internal_audio_time_base () in
   let decoder_pts = ref 0L in
   ( idx,
     stream,
@@ -92,7 +92,7 @@ let mk_video_decoder container =
   let time_base = Av.get_time_base stream in
   let pixel_aspect = Av.get_pixel_aspect stream in
   let decoder_time_base = { Avutil.num = 1; den = target_fps } in
-  let internal_time_base = Ffmpeg_utils.video_time_base () in
+  let internal_time_base = Ffmpeg_utils.liq_internal_video_time_base () in
   let decoder_pts = ref 0L in
   let cb ~buffer frame =
     let img =

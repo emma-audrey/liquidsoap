@@ -99,7 +99,7 @@ type fps = { num : int; den : int }
   * For meaningful results, one should first partially apply the freq params,
   * and re-use the resulting functions on consecutive chunks of a single
   * input stream. *)
-let resample ~in_freq ~out_freq =
+let video_resample ~in_freq ~out_freq =
   (* We have something like this:
    *
    * i i i i i i i i i i i i i i i i i i i ...
@@ -140,7 +140,7 @@ let video_resample () =
             exec resampler data
         | _ ->
             let resampler =
-              Array.init l (fun _ -> resample ~in_freq ~out_freq)
+              Array.init l (fun _ -> video_resample ~in_freq ~out_freq)
             in
             state := Some (resampler, l, in_freq, out_freq);
             exec resampler data )
